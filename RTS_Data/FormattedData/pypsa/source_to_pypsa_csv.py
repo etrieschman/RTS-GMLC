@@ -168,17 +168,19 @@ def create_gens():
     # define per-unit max/min universally. this will hopefully get overridden by timeseries data
     mask_pnom = np.where(gendata.p_nom == 0, False, True)
     gendata['p_max_pu'] = 1.
-    gendata.loc[mask_pnom, 'p_max_pu'] = gendata.loc[mask_pnom, 'pmaxmw'].values / gendata.loc[mask_pnom, 'p_nom'].values
+    gendata.loc[mask_pnom, 'p_max_pu'] = gendata.loc[mask_pnom, 'pmaxmw'] / gendata.loc[mask_pnom, 'p_nom']
     gendata['p_min_pu'] = 0.
-    gendata.loc[mask_pnom, 'p_min_pu'] = gendata.loc[mask_pnom, 'pminmw'].values / gendata.loc[mask_pnom, 'p_nom'].values
+    gendata.loc[mask_pnom, 'p_min_pu'] = gendata.loc[mask_pnom, 'pminmw'] / gendata.loc[mask_pnom, 'p_nom']
+    # NOTE: Assume hourly snapshot
+    gendata['ramp_limit_up'] = 1.
+    gendata.loc[mask_pnom, 'ramp_limit_up'] = gendata.loc[mask_pnom, 'rampratemw/min'] / gendata.loc[mask_pnom, 'p_nom']*60
     # unit commitments
     gendata['committable'] = True
     gendata.loc[gendata.carrier.isin(['Solar', 'Wind']), 'committable'] = False
     # NOTE: Assuming warm starts for all machines (options are cold, warm, and hot)
     gendata['start_up_cost'] = gendata['nonfuelstartcost$'] + gendata.startheatwarmmbtu*gendata['fuelprice$/mmbtu'] 
     gendata['shut_down_cost'] = gendata['nonfuelshutdowncost$']
-    # NOTE: Assume hourly snapshot
-    gendata['ramp_limit_up'] = gendata['rampratemw/min']/gendata.p_nom*60
+    
     # assume nuclear is always running
     gendata.loc[gendata.carrier == 'Nuclear', 'up_time_before'] = gendata.loc[gendata.carrier == 'Nuclear', 'min_up_time']
     gendata.loc[gendata.carrier != 'Nuclear', 'up_time_before'] = 0
@@ -231,10 +233,9 @@ def write_pypsa_network_csvs(snapshots):
 
 # %%
 # def test_pypsa_network():
-snapshots = 24
+snapshots = 1000
 network = pypsa.Network(snapshots=np.arange(snapshots))
 network_data = write_pypsa_network_csvs(snapshots)
 network.import_from_csv_folder('../../FormattedData/pypsa/rts-gmlc')
 network.plot(geomap=False)
 
-# %%
