@@ -10,8 +10,6 @@ import pypsa
 DIGITS = 5
 miles_to_km = 1.60934
 baseMVA = 100.
-pd.set_option('display.max_columns', None)
-pd.set_option('display.max_rows', 25)
 
 # NOTE: our objective is to use pypsa's import_from_csv_folder method
 def _read_csv(table, clean_cols=True):
@@ -40,12 +38,18 @@ def create_buses():
     column_dtype_bus = {
         'name':'str'
     }
-    busdata = _read_csv('bus.csv').rename(columns=column_map_bus).astype(column_dtype_bus)
+    busdata = _read_csv('bus.csv')
+    busdata = (busdata
+               .drop(columns=[col for col in busdata.columns if col not in column_map_bus.keys()])
+               .rename(columns=column_map_bus)
+               .astype(column_dtype_bus))
+    
     busdata = busdata.set_index('name')
     busdata.loc[busdata.type == 'Ref', 'type'] = 'Slack'
     # make names numeric
     return busdata
 
+bd = create_buses()
 
 # %%
 # TODO: confirm that we dont' need to worry about Tr Ratio (none of the other mappings handle it)
@@ -68,7 +72,7 @@ def create_branches():
         False:'capital_cost', # for capacity expansion
         False:'build_year',
         False:'lifetime',
-        'length':'length',
+        'length':'length', # defined below
         False:'carrier',
         False:'terrain_factor', # for capacity expansion
         False:'num_parallel', # ignored when type isn't set
@@ -80,13 +84,39 @@ def create_branches():
         'bus0':'str',
         'bus1':'str'
     }
-    branchdata = _read_csv('branch.csv').rename(columns=column_map_branch).astype(column_dtype_branch)
+    branchdata = _read_csv('branch.csv')
+    branchdata = (branchdata
+                  .drop(columns=[col for col in branchdata.columns if col not in column_map_branch.keys()])
+                  .rename(columns=column_map_branch)
+                #   .astype(column_dtype_branch)
+                  )
+    # merge on bus v_noms
+    branchdata = pd.merge(left=branchdata, 
+                          right=(_read_csv('bus.csv')[['busid', 'basekv']]
+                                 .rename(columns={'busid':'bus0', 'basekv':'v_nom0'})), 
+                          on='bus0')
+    branchdata = pd.merge(left=branchdata, 
+                          right=(_read_csv('bus.csv')[['busid', 'basekv']]
+                                 .rename(columns={'busid':'bus1', 'basekv':'v_nom1'})), 
+                          on='bus1')
     branchdata = branchdata.set_index('name')
+    branchdata['length'] = branchdata.length * miles_to_km
+
+    # TEMP: temporarily set linetypes
+    branchdata = branchdata.loc[branchdata.index != 'C35']
+    # branchdata.s_nom *= 100
+
+    branchdata.x *= branchdata.v_nom0**2 / baseMVA
+    branchdata.r *= branchdata.v_nom0**2 / baseMVA
+    branchdata.b /= branchdata.v_nom0**2
     return branchdata
+
+bd = create_branches()
+bd
 
 
 # %%
-def create_series(pointers:pd.DataFrame, parameter_map:dict, merge_cols=list):
+def create_series(pointers:pd.DataFrame, parameter_map:dict, merge_cols:list, scale=True ):
     # helper to pull and merge all datasets into appropriate dataframes (separate by parameter)
     series_dict = {}
     parameters = pointers['parameter'].drop_duplicates().values
@@ -99,8 +129,9 @@ def create_series(pointers:pd.DataFrame, parameter_map:dict, merge_cols=list):
         series_dict[parameter_map[p]] = df
 
     # normalize to per-unit values
-    for i, p in pointers.iterrows():
-        series_dict[parameter_map[p.parameter]][p.object] /= p.scalingfactor
+    if scale:
+        for i, p in pointers.iterrows():
+            series_dict[parameter_map[p.parameter]][p.object] /= p.scalingfactor 
 
     return series_dict
 
@@ -109,15 +140,20 @@ def create_series(pointers:pd.DataFrame, parameter_map:dict, merge_cols=list):
 def create_genseries():
     # get time-varying pointers and restrict to day ahead generation
     pointers = _read_csv('timeseries_pointers.csv')
-    pointers = pointers.loc[(pointers.simulation == 'DAY_AHEAD') & (pointers.category == 'Generator') & (pointers.object != '212_CSP_HEAD_STORAGE')]
+    pointers = pointers.loc[(pointers.simulation == 'DAY_AHEAD') & 
+                            (pointers.category == 'Generator') & 
+                            (pointers.object != '212_CSP_HEAD_STORAGE')]
     parameter_map = {'PMax MW':'p_max_pu', 'PMin MW':'p_min_pu'}
     merge_cols = ['Year', 'Month', 'Day', 'Period']
     genseries = create_series(pointers, parameter_map, merge_cols)
     
     return genseries
 
+genseries = create_genseries()
+genseries
+
 # %%
-def create_gens():
+def create_gens(unit_commitment):
     # Create generator data
     column_map_gen = {
         'genuid':'name',
@@ -154,7 +190,10 @@ def create_gens():
         False:'ramp_limit_shut_down', # not available
         False:'weight' # used for aggregation
     }
-    gendata = _read_csv('gen.csv').rename(columns=column_map_gen)
+    gendata = _read_csv('gen.csv')
+    gendata = (gendata
+            #    .drop(columns=[col for col in gendata.columns if col not in column_map_gen.keys()])
+               .rename(columns=column_map_gen))
     # NOTE: Assume generator control is set by bus
     # NOTE: Dropping synchronous condensers, of which there are 3
     # NOTE: Dropping CSP, of which there is 1
@@ -172,14 +211,17 @@ def create_gens():
     gendata['p_min_pu'] = 0.
     gendata.loc[mask_pnom, 'p_min_pu'] = gendata.loc[mask_pnom, 'pminmw'] / gendata.loc[mask_pnom, 'p_nom']
     # NOTE: Assume hourly snapshot
-    gendata['ramp_limit_up'] = 1.
+    gendata['ramp_limit_up'] = np.nan
     gendata.loc[mask_pnom, 'ramp_limit_up'] = gendata.loc[mask_pnom, 'rampratemw/min'] / gendata.loc[mask_pnom, 'p_nom']*60
     # unit commitments
-    gendata['committable'] = True
+    gendata['committable'] = unit_commitment
     gendata.loc[gendata.carrier.isin(['Solar', 'Wind']), 'committable'] = False
     # NOTE: Assuming warm starts for all machines (options are cold, warm, and hot)
     gendata['start_up_cost'] = gendata['nonfuelstartcost$'] + gendata.startheatwarmmbtu*gendata['fuelprice$/mmbtu'] 
     gendata['shut_down_cost'] = gendata['nonfuelshutdowncost$']
+
+    #TEMP
+    # gendata.p_nom *= 1000
     
     # assume nuclear is always running
     gendata.loc[gendata.carrier == 'Nuclear', 'up_time_before'] = gendata.loc[gendata.carrier == 'Nuclear', 'min_up_time']
@@ -195,47 +237,85 @@ def create_gens():
 
     return gendata, genseries
 
+gd, gs = create_gens(True)
+gd
+
 
 # %%
 # TODO -- storage data
-storgendata = gendata.loc[gendata.carrier == 'Storage'].copy()
-storgendata
+# storgendata = gendata.loc[gendata.carrier == 'Storage'].copy()
+# storgendata
 
 
 # %%
-# TODO: Load data
-# column_map_load = {
-#     False:'name',	
-#     False:'bus', 
-#     False:'carrier',	
-#     False:'type',	
-#     False:'p_set',	
-#     False:'q_set',	
-#     False:'sign',	
-# }
-# loaddata = _read_csv('load')
-# loaddata
+def create_loadseries():
+    # get time-varying pointers and restrict to day ahead generation
+    pointers = _read_csv('timeseries_pointers.csv')
+    pointers = pointers.loc[(pointers.simulation == 'DAY_AHEAD') & (pointers.category == 'Area')]
+    parameter_map = {'MW Load':'p_set',}
+    merge_cols = ['Year', 'Month', 'Day', 'Period']
+    loadseries = create_series(pointers, parameter_map, merge_cols, scale=True)
+    loadseries = loadseries['p_set']
+    return loadseries
+
 
 # %%
-def write_pypsa_network_csvs(snapshots):
+def create_loads():
+    # Load data
+    column_map_load = {
+        False:'name', # defined below	
+        'busid':'bus', 
+        False:'carrier', # defined below	
+        False:'type', # not used
+        False:'p_set',	# set in timeseries
+        False:'q_set',	# not used
+        False:'sign', # use default, that load is negative
+        'mwload':'mwload', # used to distribute load
+        'area':'area' # used to distribute load
+    }
+    column_dtype_load = {
+            'bus':'str',
+            'area':'str'
+        }
+    loaddata = _read_csv('bus.csv')
+    loaddata = (loaddata
+                .drop(columns=[col for col in loaddata.columns if col not in column_map_load.keys()])
+                .rename(columns=column_map_load)
+                .astype(column_dtype_load)
+                .set_index('bus', drop=False))
+    loaddata.index.rename('name', inplace=True)
+    loaddata['carrier'] = 'AC'
+
+    loadseries = create_loadseries()
+    for i, b in loaddata.iterrows():
+        loadseries[b.bus] = loadseries[b.area] * b.mwload
+
+    loadseries = loadseries.drop(columns=['1', '2', '3', 'Year', 'Month', 'Day', 'Period'])
+
+    return loaddata, loadseries
+
+ld, ls = create_loads()
+ld
+
+# %%
+def write_pypsa_network_csvs(snapshots, start_index, unit_commitment):
     start_path = os.path.join('..', "..", "FormattedData", 'pypsa', 'rts-gmlc')
     # buses
     create_buses().to_csv(os.path.join(start_path, 'buses.csv'))
     # lines
     create_branches().to_csv(os.path.join(start_path, 'lines.csv'))
     # generators
-    gendata, genseries = create_gens()
+    gendata, genseries = create_gens(unit_commitment)
     gendata.to_csv(os.path.join(start_path, 'generators.csv'))
     for k in genseries.keys():
-        genseries[k].iloc[:snapshots].to_csv(os.path.join(start_path, f'generators-{k}.csv'), index=False)
-
+        (genseries[k]
+         .iloc[start_index:start_index+snapshots]
+         .drop(columns=['Year', 'Month', 'Day', 'Period'])
+         .to_csv(os.path.join(start_path, f'generators-{k}.csv'), index=True))
+    # loads
+    loaddata, loadseries = create_loads()
+    loaddata.to_csv(os.path.join(start_path, 'loads.csv'))
+    loadseries.iloc[start_index:start_index+snapshots].to_csv(os.path.join(start_path, 'loads-p_set.csv'), index=True)
+    
     return
-
-# %%
-# def test_pypsa_network():
-snapshots = 1000
-network = pypsa.Network(snapshots=np.arange(snapshots))
-network_data = write_pypsa_network_csvs(snapshots)
-network.import_from_csv_folder('../../FormattedData/pypsa/rts-gmlc')
-network.plot(geomap=False)
 
