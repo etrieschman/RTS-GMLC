@@ -13,7 +13,7 @@ pd.set_option('display.max_rows', None)
 # %%
 # Build network
 snapshots = 2
-start_index = 10
+start_index = 6
 network = pypsa.Network(snapshots=np.arange(snapshots))
 network_data = write_pypsa_network_csvs(snapshots, start_index, unit_commitment=False)
 network.import_from_csv_folder('../../FormattedData/pypsa/rts-gmlc')
@@ -43,7 +43,7 @@ plot_series(network.generators_t.p_min_pu, 'Generators min pu', False)
 # %%
 print('Min generation', (network.generators.p_min_pu * network.generators.p_nom).sum())
 print('Load by snapshot', network.loads_t.p_set.sum(axis=1))
-
+network.generators.p_nom
 
 
 

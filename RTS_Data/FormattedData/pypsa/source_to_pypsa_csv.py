@@ -160,7 +160,7 @@ def create_gens(unit_commitment):
         'busid':'bus',
         False:'control', # defined by bus (below)
         'unittype':'type',
-        'mwinj':'p_nom', # real power injection set-point
+        False:'p_nom', # set below
         False:'p_nom_extendable', # for capacity expansion
         False:'p_nom_min', # for capacity expansion
         False:'p_nom_max', # for capacity expansion
@@ -198,24 +198,27 @@ def create_gens(unit_commitment):
     # NOTE: Dropping synchronous condensers, of which there are 3
     # NOTE: Dropping CSP, of which there is 1
     # non-storage generation
-    gendata = gendata.loc[gendata.carrier.isin(['NG', 'Oil', 'Coal', 'Nuclear', 'Hydro', 'Solar', 'Wind'])].copy()
+    intermittent_list = ['Solar', 'Wind']
+    nonintermittent_list = ['NG', 'Oil', 'Coal', 'Nuclear', 'Hydro']
+    gendata = gendata.loc[gendata.carrier.isin(intermittent_list + nonintermittent_list)].copy()
     gendata = gendata.loc[gendata.category != 'CSP']
     gendata = pd.merge(left=gendata, 
                     right=_read_csv('bus.csv')[['busid', 'bustype']].rename(columns={'busid':'bus','bustype':'control'}), 
                         on='bus').set_index('name')
     gendata.loc[gendata.control == 'Ref', 'control'] = 'Slack'
-    # define per-unit max/min universally. this will hopefully get overridden by timeseries data
-    mask_pnom = np.where(gendata.p_nom == 0, False, True)
-    gendata['p_max_pu'] = 1.
-    gendata.loc[mask_pnom, 'p_max_pu'] = gendata.loc[mask_pnom, 'pmaxmw'] / gendata.loc[mask_pnom, 'p_nom']
-    gendata['p_min_pu'] = 0.
-    gendata.loc[mask_pnom, 'p_min_pu'] = gendata.loc[mask_pnom, 'pminmw'] / gendata.loc[mask_pnom, 'p_nom']
+    # define p_nom
+    gendata.loc[gendata.carrier.isin(intermittent_list), 'p_nom'] = gendata.pmaxmw
+    gendata.loc[gendata.carrier.isin(nonintermittent_list), 'p_nom'] = gendata.mwinj
+    gendata['p_max_pu'] = gendata.pmaxmw / gendata.p_nom
+    gendata['p_min_pu'] = gendata.pminmw / gendata.p_nom
     # NOTE: Assume hourly snapshot
     gendata['ramp_limit_up'] = np.nan
-    gendata.loc[mask_pnom, 'ramp_limit_up'] = gendata.loc[mask_pnom, 'rampratemw/min'] / gendata.loc[mask_pnom, 'p_nom']*60
+    gendata.loc[gendata.carrier.isin(nonintermittent_list), 'ramp_limit_up'] = (
+        gendata.loc[gendata.carrier.isin(nonintermittent_list), 'rampratemw/min'] / 
+        gendata.loc[gendata.carrier.isin(nonintermittent_list), 'p_nom']*60)
     # unit commitments
     gendata['committable'] = unit_commitment
-    gendata.loc[gendata.carrier.isin(['Solar', 'Wind']), 'committable'] = False
+    gendata.loc[gendata.carrier.isin(intermittent_list), 'committable'] = False
     # NOTE: Assuming warm starts for all machines (options are cold, warm, and hot)
     gendata['start_up_cost'] = gendata['nonfuelstartcost$'] + gendata.startheatwarmmbtu*gendata['fuelprice$/mmbtu'] 
     gendata['shut_down_cost'] = gendata['nonfuelshutdowncost$']
@@ -254,7 +257,7 @@ def create_loadseries():
     pointers = pointers.loc[(pointers.simulation == 'DAY_AHEAD') & (pointers.category == 'Area')]
     parameter_map = {'MW Load':'p_set',}
     merge_cols = ['Year', 'Month', 'Day', 'Period']
-    loadseries = create_series(pointers, parameter_map, merge_cols, scale=True)
+    loadseries = create_series(pointers, parameter_map, merge_cols, scale=False)
     loadseries = loadseries['p_set']
     return loadseries
 
@@ -285,17 +288,19 @@ def create_loads():
                 .set_index('bus', drop=False))
     loaddata.index.rename('name', inplace=True)
     loaddata['carrier'] = 'AC'
+    loaddata['pct_areaload'] = loaddata.mwload / loaddata.groupby('area')['mwload'].transform('sum')
 
     loadseries = create_loadseries()
     for i, b in loaddata.iterrows():
-        loadseries[b.bus] = loadseries[b.area] * b.mwload
+        loadseries[b.bus] = loadseries[b.area] * b.pct_areaload
 
     loadseries = loadseries.drop(columns=['1', '2', '3', 'Year', 'Month', 'Day', 'Period'])
 
     return loaddata, loadseries
 
 ld, ls = create_loads()
-ld
+ls
+
 
 # %%
 def write_pypsa_network_csvs(snapshots, start_index, unit_commitment):
