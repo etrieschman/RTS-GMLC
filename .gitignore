@@ -3,3 +3,5 @@
 .Rapp.history
 .Rhistory
 *.qgs~
+
+__pycache__/
