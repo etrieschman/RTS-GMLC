@@ -15,7 +15,7 @@ pd.set_option('display.max_rows', None)
 
 # %%
 # Build network
-ss_length = 24*7
+ss_length = 24*2
 ss_start = 0
 snapshots = pd.date_range(start='1/1/2020', end='1/1/2021', freq='H')[ss_start:ss_start+ss_length]
 network_data = write_pypsa_network_csvs(snapshots, unit_commitment=True, save_path=os.path.join(path_file, '..', 'rts-gmlc/'))
